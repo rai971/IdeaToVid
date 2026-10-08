@@ -1,0 +1,20 @@
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+
+# Local data and generated media
+finance_brief.db
+assets/
+outputs/
+
+# Python artifacts and local runtime caches
+__pycache__/
+*.py[cod]
+work/pydeps/
+work/kokoro_pydeps/
+work/kokoro_cache/
+
+# Editor and OS artifacts
+*.swp
+.DS_Store
