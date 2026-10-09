@@ -15,9 +15,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent
 LOCAL_PACKAGES = ROOT / "work" / "pydeps"
@@ -63,6 +64,28 @@ def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def parse_eastern_schedule(value):
+    """Convert a local Eastern datetime input into Meta's Unix publish timestamp."""
+    try:
+        local = datetime.fromisoformat(str(value).strip())
+    except (TypeError, ValueError):
+        raise ValueError("Choose a valid date and time in Eastern Time.")
+    if local.tzinfo is not None:
+        raise ValueError("Enter the time using the Eastern Time field in the app.")
+    eastern = ZoneInfo("America/New_York")
+    local = local.replace(tzinfo=eastern, fold=0)
+    utc_value = local.astimezone(timezone.utc)
+    # Reject nonexistent local times during the spring daylight-saving jump.
+    if utc_value.astimezone(eastern).replace(tzinfo=None) != local.replace(tzinfo=None):
+        raise ValueError("That Eastern Time does not exist because clocks move forward. Choose another time.")
+    current = datetime.now(timezone.utc)
+    if utc_value < current + timedelta(minutes=10):
+        raise ValueError("Schedule the Reel at least 10 minutes from now in Eastern Time.")
+    if utc_value > current + timedelta(days=183):
+        raise ValueError("Schedule the Reel within the next six months.")
+    return int(utc_value.timestamp()), utc_value.isoformat(timespec="seconds")
+
+
 def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -76,7 +99,7 @@ def db():
     for name in ("audio_file", "clip_file", "clip_url", "clip_author", "clip_page", "render_file", "visual_plan"):
         if name not in columns:
             conn.execute(f"ALTER TABLE stories ADD COLUMN {name} TEXT DEFAULT ''")
-    for name in ("fb_publish_state", "fb_video_id", "fb_upload_url", "fb_permalink", "fb_published_at"):
+    for name in ("fb_publish_state", "fb_video_id", "fb_upload_url", "fb_permalink", "fb_published_at", "fb_scheduled_at", "video_text"):
         if name not in columns:
             conn.execute(f"ALTER TABLE stories ADD COLUMN {name} TEXT DEFAULT ''")
     if "visual_mode" not in columns:
@@ -284,6 +307,28 @@ def meta_graph_post(path, fields, token):
     return data
 
 
+def meta_graph_get(path, fields, token):
+    version = os.environ.get("META_GRAPH_API_VERSION", "v26.0").strip()
+    query = urllib.parse.urlencode(fields)
+    url = f"https://graph.facebook.com/{version}/{path.lstrip('/')}?{query}"
+    request = urllib.request.Request(url, headers={"Authorization": "Bearer " + token})
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = json.loads(response.read(1_000_000))
+    except urllib.error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read(4096))
+            detail = safe_text(payload.get("error", {}).get("message", ""))
+        except Exception:
+            detail = ""
+        raise RuntimeError(f"Meta API returned HTTP {exc.code}" + (f": {detail[:220]}" if detail else ".")) from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError("Could not reach Meta. Check the internet connection and try again.") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError("Meta returned an unexpected response.")
+    return data
+
+
 def meta_upload_reel(upload_url, token, video_path):
     if urllib.parse.urlparse(upload_url).hostname != "rupload.facebook.com":
         raise RuntimeError("Meta returned an unexpected Reel upload host.")
@@ -327,12 +372,20 @@ def call_ai(system_prompt, user_prompt, schema=None, max_output_tokens=500):
     else:
         generation_config = {"maxOutputTokens": max_output_tokens}
         if schema:
+            # The legacy responseSchema type rejects JSON Schema's additionalProperties field.
             allowed_schema_keys = {"type", "properties", "required", "items", "enum", "description", "format", "nullable", "minimum", "maximum", "minItems", "maxItems"}
             def gemini_schema(value):
                 if isinstance(value, list):
                     return [gemini_schema(item) for item in value]
                 if isinstance(value, dict):
-                    return {key: gemini_schema(child) for key, child in value.items() if key in allowed_schema_keys}
+                    normalized = {}
+                    for key, child in value.items():
+                        if key == "properties" and isinstance(child, dict):
+                            # Property names (e.g. "queries") are schema data, not schema keywords.
+                            normalized[key] = {name: gemini_schema(prop_schema) for name, prop_schema in child.items()}
+                        elif key in allowed_schema_keys:
+                            normalized[key] = gemini_schema(child)
+                    return normalized
                 return value
             generation_config.update({"responseMimeType": "application/json", "responseSchema": gemini_schema(schema)})
         payload = {"systemInstruction": {"parts": [{"text": system_prompt}]},
@@ -541,40 +594,115 @@ def fetch_feed(feed):
     return found
 
 
-def make_script(story):
-    """Generate an attributed, non-advisory first draft; never imply independent verification."""
+SOCIAL_COPY_PROMPT = (
+    "Create Facebook Reel copy for a U.S. audience from the supplied reporting only. "
+    "Optimize for watch-through and meaningful engagement with clear, concrete language, not deception or outrage. "
+    "The description must be detailed (about 120–180 words), open with a compelling but accurate first line, "
+    "explain what happened, why the reported facts may matter to everyday Americans, add relevant context and caveats, "
+    "credit the publisher and include the exact source URL, then end with a natural question inviting informed discussion. "
+    "Use short paragraphs for mobile readability and 3–5 specific, relevant hashtags. Avoid keyword stuffing, "
+    "unsupported impact claims, fake urgency, sensationalism, invented details, investment/financial advice, "
+    "buy/sell/hold language, price forecasts, or guarantees. Say when evidence is limited. Include a brief news-not-advice note. "
+    "The on-video opening text must be 3–7 words, no more than 42 characters, factual, readable at a glance, "
+    "and create curiosity about the actual story without promising more than it delivers."
+)
+
+
+def fallback_social_copy(story):
     title = story["title"].strip().rstrip(".")
-    summary = story["summary"].strip()
-    if not summary:
-        summary = "The source has more detail, and the numbers behind this story matter."
-    # Keep it factual and short until a configured LLM is available.
+    summary = safe_text(story.get("summary", "")) or "The publisher’s report contains the full details and context."
+    source = story["source"].strip()
+    caption = (f"Here’s what this headline says—and what it doesn’t.\n\n{title}.\n\n"
+               f"{summary[:850]}\n\nThis reel summarizes reporting from {source}. "
+               f"Read the original report for the full context: {story['url']}\n\n"
+               "What detail should we explain next? This is news, not financial advice.\n\n"
+               "#USNews #Economy #FinanceNews")
+    hook = title if len(title) <= 42 else title[:39].rsplit(" ", 1)[0].rstrip(" ,:;-") + "…"
+    return {"caption": caption[:4000], "video_text": hook[:42]}
+
+
+def ensure_source_credit(caption, story):
+    caption = str(caption or "").strip()
+    source = safe_text(story.get("source", "Publisher")) or "Publisher"
+    source_url = safe_text(story.get("url", ""))
+    if source.casefold() not in caption.casefold() or (source_url and source_url not in caption):
+        caption += f"\n\nSource: {source}. Read the original report: {source_url}"
+    if "financial advice" not in caption.casefold():
+        caption += "\n\nThis is news, not financial advice."
+    return caption[:4000]
+
+
+def make_content_package(story):
+    """Create a fact-bound voice script, detailed post description, and opening overlay."""
+    title = story["title"].strip().rstrip(".")
+    summary = story["summary"].strip() or "The publisher’s report contains the full details and context."
     provider = configured_ai_provider()
-    if provider:
+    if not provider:
+        script = (f"Here’s what the headline says: {title}. {summary[:480]} "
+                  f"This is based on reporting from {story['source']}. Check the original report for details and context. "
+                  "This is news, not financial advice.")
+        return {"script": script, **fallback_social_copy(story)}
+    schema = {"type": "object", "properties": {
+        "script": {"type": "string"}, "caption": {"type": "string"}, "video_text": {"type": "string"}},
+        "required": ["script", "caption", "video_text"], "additionalProperties": False}
+    try:
+        output = call_ai(
+            "You are the editorial producer for The Finance Brief, a U.S. finance-news page. "
+            "Write three distinct deliverables: spoken reel narration, a detailed Facebook description, and a short on-video opening hook. "
+            "For narration, target 90–115 spoken words: put the strongest verified fact or consequence first, explain the development in plain English, attribute the publisher, and close neutrally. "
+            + SOCIAL_COPY_PROMPT + " Return only JSON matching the requested schema.",
+            f"Headline: {title}\nTopic: {story.get('topic','')}\nPublisher: {story['source']}\n"
+            f"Exact source URL: {story['url']}\nReported summary (the only facts you may use): {summary[:2000]}",
+            schema, 900)
+        content = json.loads(output)
+        script = safe_text(content.get("script", "")).strip()
+        caption = str(content.get("caption", "")).strip()
+        video_text = safe_text(content.get("video_text", "")).strip()
+        if not script or not caption or not video_text:
+            raise RuntimeError(f"{provider.title()} returned incomplete reel copy.")
+        if len(video_text) > 42:
+            video_text = video_text[:39].rsplit(" ", 1)[0].rstrip(" ,:;-") + "…"
+        return {"script": script[:12000], "caption": ensure_source_credit(caption, story), "video_text": video_text}
+    except urllib.error.HTTPError as exc:
         try:
-            out = call_ai("Write concise, engaging U.S. finance news reel scripts, around 90 words. Use only supplied source facts; do not invent numbers, causes, quotes, predictions, or advice. No buy/sell/hold guidance. Attribute the source in the script. Mark uncertainty. Use a strong but accurate first sentence, then explain why it matters, then a neutral close. Return only spoken script.",
-                          f"Headline: {title}\nSource: {story['source']}\nSource URL: {story['url']}\nSource summary: {summary}", max_output_tokens=260)
-            if out.strip():
-                return out.strip()
-            raise RuntimeError(f"{provider.title()} returned an empty script.")
-        except urllib.error.HTTPError as exc:
-            # Surface the provider's diagnosis, never request headers or keys.
-            try:
-                error_data = json.loads(exc.read(4096))
-                detail = safe_text(error_data.get("error", {}).get("message", ""))
-            except Exception:
-                detail = ""
-            suffix = f": {detail[:220]}" if detail else ""
-            raise RuntimeError(f"{provider.title()} API returned HTTP {exc.code}{suffix}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"Could not reach the {provider.title()} API. Check your internet connection and try again.") from exc
-        except Exception as exc:
-            if isinstance(exc, RuntimeError) and ("API returned HTTP" in str(exc) or "Could not reach" in str(exc)):
-                raise
-            raise RuntimeError(f"{provider.title()} drafting failed ({type(exc).__name__}). Check its API key and model, then try again.") from exc
-    return (f"Here’s the number behind today’s headline: {title}. "
-            f"{summary[:420]} "
-            f"This update is based on reporting from {story['source']}. Check the source linked with this post for the full context. "
-            "This is a news update, not financial advice.")
+            error_data = json.loads(exc.read(4096))
+            detail = safe_text(error_data.get("error", {}).get("message", ""))
+        except Exception:
+            detail = ""
+        suffix = f": {detail[:220]}" if detail else ""
+        raise RuntimeError(f"{provider.title()} API returned HTTP {exc.code}{suffix}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Could not reach the {provider.title()} API. Check your internet connection and try again.") from exc
+    except Exception as exc:
+        if isinstance(exc, RuntimeError) and ("API returned HTTP" in str(exc) or "Could not reach" in str(exc)):
+            raise
+        raise RuntimeError(f"{provider.title()} drafting failed ({type(exc).__name__}). Check its API key and model, then try again.") from exc
+
+
+def make_social_copy(story):
+    """Regenerate the post description and on-video opening text for an existing script."""
+    provider = configured_ai_provider()
+    if not provider:
+        return fallback_social_copy(story)
+    schema = {"type": "object", "properties": {"caption": {"type": "string"}, "video_text": {"type": "string"}},
+              "required": ["caption", "video_text"], "additionalProperties": False}
+    try:
+        output = call_ai(SOCIAL_COPY_PROMPT + " Return only JSON matching the requested schema.",
+                         f"Headline: {story['title']}\nPublisher: {story['source']}\nExact source URL: {story['url']}\n"
+                         f"Reported summary (the only facts you may use): {story['summary'][:2000]}\n"
+                         f"Approved-for-review voiceover script: {story['script'][:3500]}", schema, 600)
+        content = json.loads(output)
+        caption = str(content.get("caption", "")).strip()
+        video_text = safe_text(content.get("video_text", "")).strip()
+        if not caption or not video_text:
+            raise RuntimeError(f"{provider.title()} returned incomplete social copy.")
+        if len(video_text) > 42:
+            video_text = video_text[:39].rsplit(" ", 1)[0].rstrip(" ,:;-") + "…"
+        return {"caption": ensure_source_credit(caption, story), "video_text": video_text}
+    except Exception as exc:
+        if isinstance(exc, RuntimeError) and ("API returned HTTP" in str(exc) or "Could not reach" in str(exc)):
+            raise
+        raise RuntimeError(f"{provider.title()} social copy failed ({type(exc).__name__}). Check its API key and model, then try again.") from exc
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -657,6 +785,22 @@ class Handler(BaseHTTPRequestHandler):
         try:
             payload = self.body()
             conn = db()
+            if self.path == "/api/meta/test":
+                if not meta_configured():
+                    conn.close()
+                    return self.send_json({"error": "Save the Facebook Page ID and Page access token first."}, 400)
+                try:
+                    # /me identifies the entity represented by the token. This rejects a
+                    # User Access Token that can read the Page but cannot publish as it.
+                    page = meta_graph_get("me", {"fields": "id,name"}, os.environ["META_PAGE_ACCESS_TOKEN"])
+                    if str(page.get("id", "")) != os.environ["META_PAGE_ID"]:
+                        raise RuntimeError("The saved token does not represent the configured Page. Use the Page access_token returned for this Page by /me/accounts.")
+                except Exception as exc:
+                    conn.close()
+                    return self.send_json({"error": str(exc)[:300]}, 502)
+                conn.close()
+                return self.send_json({"ok": True, "page_name": safe_text(page.get("name", "Facebook Page")),
+                                       "message": f"Connected to {safe_text(page.get('name', 'your Facebook Page'))}."})
             if self.path == "/api/settings":
                 provider = str(payload.get("ai_provider", "auto")).strip().lower()
                 if provider not in ("auto", "openai", "gemini", "none"):
@@ -868,7 +1012,8 @@ class Handler(BaseHTTPRequestHandler):
                     srt_path.write_text(make_captions(story["script"], duration), encoding="utf-8")
                     hook_name = f"hook-{sid}.txt"
                     hook_path = ASSET_DIR / hook_name
-                    title_words, title_lines, line = story["title"].split(), [], ""
+                    overlay_text = safe_text(story.get("video_text") or story["title"]).upper()
+                    title_words, title_lines, line = overlay_text.split(), [], ""
                     for word in title_words:
                         if line and len(line) + len(word) + 1 > 25:
                             title_lines.append(line)
@@ -1040,6 +1185,20 @@ class Handler(BaseHTTPRequestHandler):
                     if candidate.parent == ASSET_DIR and candidate.is_file():
                         candidate.unlink(missing_ok=True)
                 return self.send_json({"ok": True, "message": "Rejected idea and its local media were deleted."})
+            reconcile_match = re.fullmatch(r"/api/stories/(\d+)/resolve-publish", self.path)
+            if reconcile_match:
+                sid = int(reconcile_match.group(1))
+                if payload.get("confirmed_not_published") is not True:
+                    conn.close()
+                    return self.send_json({"error": "Confirm that you checked the Page and did not find this Reel."}, 400)
+                story = conn.execute("SELECT status,fb_publish_state,fb_video_id FROM stories WHERE id=?", (sid,)).fetchone()
+                if not story or story["status"] != "approved" or story["fb_publish_state"] != "publish_unknown" or not story["fb_video_id"]:
+                    conn.close()
+                    return self.send_json({"error": "This reel is not waiting for a publishing check."}, 409)
+                conn.execute("UPDATE stories SET fb_publish_state='uploaded' WHERE id=?", (sid,))
+                conn.commit()
+                conn.close()
+                return self.send_json({"ok": True, "message": "Retry enabled. Check once more, then publish when ready."})
             publish_match = re.fullmatch(r"/api/stories/(\d+)/publish", self.path)
             if publish_match:
                 sid = int(publish_match.group(1))
@@ -1054,11 +1213,23 @@ class Handler(BaseHTTPRequestHandler):
                 if story["status"] != "approved" or not story["script"] or not story["render_file"]:
                     conn.close()
                     return self.send_json({"error": "Only an approved reel with a rendered preview can be published."}, 400)
+                schedule_value = str(payload.get("schedule_time_et", "")).strip()
+                schedule_timestamp = None
+                schedule_iso = ""
+                if schedule_value:
+                    try:
+                        schedule_timestamp, schedule_iso = parse_eastern_schedule(schedule_value)
+                    except ValueError as exc:
+                        conn.close()
+                        return self.send_json({"error": str(exc)}, 400)
                 state = story.get("fb_publish_state") or ""
                 if state == "published":
                     conn.close()
                     return self.send_json({"error": "This reel has already been published."}, 409)
-                if state in ("starting", "publishing", "publish_unknown"):
+                if state == "scheduled":
+                    conn.close()
+                    return self.send_json({"error": "This reel is already scheduled on Facebook."}, 409)
+                if state in ("starting", "transfer_in_progress", "publishing", "publish_unknown"):
                     conn.close()
                     return self.send_json({"error": "A previous publishing attempt may still be processing. Check the Facebook Page before retrying."}, 409)
                 render_name = Path(story["render_file"]).name
@@ -1077,7 +1248,7 @@ class Handler(BaseHTTPRequestHandler):
                         return self.send_json({"error": "Another publish request is already handling this reel."}, 409)
                     conn.commit()
                     try:
-                        started = meta_graph_post(f"{page_id}/video_reels", {"upload_phase": "start"}, token)
+                        started = meta_graph_post("me/video_reels", {"upload_phase": "start"}, token)
                         video_id = str(started.get("video_id", ""))
                         upload_url = str(started.get("upload_url", ""))
                         if not video_id or not upload_url:
@@ -1087,38 +1258,62 @@ class Handler(BaseHTTPRequestHandler):
                         conn.execute("UPDATE stories SET fb_publish_state='uploading',fb_video_id=?,fb_upload_url=? WHERE id=?",
                                      (video_id, upload_url, sid))
                         conn.commit()
+                        state = "uploading"
                     except Exception as exc:
                         conn.execute("UPDATE stories SET fb_publish_state='failed' WHERE id=?", (sid,))
                         conn.commit()
                         conn.close()
-                        return self.send_json({"error": str(exc)[:300]}, 502)
-                if state != "uploaded":
+                        return self.send_json({"error": f"Meta Reel start step failed (before video upload): {str(exc)[:240]}"}, 502)
+                if state == "uploading":
+                    claimed = conn.execute("UPDATE stories SET fb_publish_state='transfer_in_progress' WHERE id=? AND fb_publish_state='uploading'", (sid,))
+                    if claimed.rowcount != 1:
+                        conn.close()
+                        return self.send_json({"error": "Another request is currently uploading this reel."}, 409)
+                    conn.commit()
                     try:
                         meta_upload_reel(upload_url, token, video_path)
                         conn.execute("UPDATE stories SET fb_publish_state='uploaded' WHERE id=?", (sid,))
                         conn.commit()
                     except Exception as exc:
+                        conn.execute("UPDATE stories SET fb_publish_state='uploading' WHERE id=? AND fb_publish_state='transfer_in_progress'", (sid,))
+                        conn.commit()
                         conn.close()
-                        return self.send_json({"error": f"Reel upload failed. Retry to resume this upload: {str(exc)[:220]}"}, 502)
-                conn.execute("UPDATE stories SET fb_publish_state='publishing' WHERE id=?", (sid,))
+                        return self.send_json({"error": f"Meta video transfer step failed. Retry to resume this upload: {str(exc)[:220]}"}, 502)
+                    state = "uploaded"
+                claimed = conn.execute("UPDATE stories SET fb_publish_state='publishing' WHERE id=? AND fb_publish_state='uploaded'", (sid,))
+                if claimed.rowcount != 1:
+                    conn.close()
+                    return self.send_json({"error": "This upload is no longer ready to publish. Refresh and check Facebook before retrying."}, 409)
                 conn.commit()
                 try:
-                    finished = meta_graph_post(f"{page_id}/video_reels",
+                    finished = meta_graph_post("me/video_reels",
                                                {"video_id": video_id, "upload_phase": "finish",
-                                                "video_state": "PUBLISHED", "title": story["title"],
+                                                "video_state": "SCHEDULED" if schedule_timestamp else "PUBLISHED",
+                                                **({"scheduled_publish_time": schedule_timestamp} if schedule_timestamp else {}),
+                                                "title": story["title"],
                                                 "description": story["caption"] or ""}, token)
                     if finished.get("success") is not True:
                         raise RuntimeError("Meta did not confirm publication.")
                 except Exception as exc:
-                    conn.execute("UPDATE stories SET fb_publish_state='publish_unknown' WHERE id=?", (sid,))
+                    error_text = str(exc)
+                    # A completed 4xx response is a definite rejection and can be retried
+                    # after fixing the Page token/permissions. Network/5xx failures are
+                    # ambiguous, so block retries that could create duplicate posts.
+                    next_state = "uploaded" if re.search(r"Meta API returned HTTP 4\d\d", error_text) else "publish_unknown"
+                    conn.execute("UPDATE stories SET fb_publish_state=? WHERE id=?", (next_state, sid))
                     conn.commit()
                     conn.close()
-                    return self.send_json({"error": "Meta may have received the publish request. Check your Facebook Page before trying again. " + str(exc)[:180]}, 502)
-                conn.execute("UPDATE stories SET fb_publish_state='published',fb_published_at=? WHERE id=?", (now(), sid))
+                    message = (("Meta Reel finish step failed after the video uploaded. Check your Page publishing permissions and settings, then retry. "
+                                if next_state == "uploaded" else "Meta Reel finish step had an unclear result. Check your Facebook Page before trying again. "))
+                    return self.send_json({"error": message + error_text[:160]}, 502)
+                if schedule_timestamp:
+                    conn.execute("UPDATE stories SET fb_publish_state='scheduled',fb_scheduled_at=?,fb_published_at='' WHERE id=?", (schedule_iso, sid))
+                else:
+                    conn.execute("UPDATE stories SET fb_publish_state='published',fb_published_at=?,fb_scheduled_at='' WHERE id=?", (now(), sid))
                 conn.commit()
                 updated = row_dict(conn.execute("SELECT * FROM stories WHERE id=?", (sid,)).fetchone())
                 conn.close()
-                return self.send_json({"story": updated, "message": "Reel published to your Facebook Page."})
+                return self.send_json({"story": updated, "message": "Reel scheduled on your Facebook Page." if schedule_timestamp else "Reel published to your Facebook Page."})
             match = re.fullmatch(r"/api/stories/(\d+)/(draft|approve|reject|revise)", self.path)
             if match:
                 sid, action = int(match.group(1)), match.group(2)
@@ -1130,20 +1325,21 @@ class Handler(BaseHTTPRequestHandler):
                     if story["status"] == "approved" or story["status"] == "rejected":
                         conn.close()
                         return self.send_json({"error": "This idea cannot be drafted from its current status."}, 400)
-                    script = make_script(dict(story))
-                    conn.execute("UPDATE stories SET script=?,caption=?,status='draft',audio_file='',render_file='',visual_plan='' WHERE id=?", (script, f"{story['title']} — via {story['source']}. News, not financial advice. #Finance #Economy", sid))
+                    package = make_content_package(dict(story))
+                    conn.execute("UPDATE stories SET script=?,caption=?,video_text=?,status='draft',audio_file='',render_file='',visual_plan='' WHERE id=?",
+                                 (package["script"], package["caption"], package["video_text"], sid))
                 elif action == "approve":
                     if not story["script"] or not story["render_file"]:
                         conn.close()
                         return self.send_json({"error": "Render and review the complete reel before approving it."}, 400)
                     conn.execute("UPDATE stories SET status='approved' WHERE id=?", (sid,))
                 elif action == "revise":
-                    if story["status"] != "approved" or (story["fb_publish_state"] or "") in ("published", "uploading", "uploaded", "starting", "publishing", "publish_unknown"):
+                    if story["status"] != "approved" or (story["fb_publish_state"] or "") in ("published", "scheduled", "uploading", "transfer_in_progress", "uploaded", "starting", "publishing", "publish_unknown"):
                         conn.close()
                         return self.send_json({"error": "This reel cannot be revised now. Check its Facebook publishing status first."}, 400)
                     conn.execute("UPDATE stories SET status='draft' WHERE id=?", (sid,))
                 else:
-                    if (story["fb_publish_state"] or "") in ("published", "publishing", "publish_unknown"):
+                    if (story["fb_publish_state"] or "") in ("published", "scheduled", "publishing", "publish_unknown", "transfer_in_progress"):
                         conn.close()
                         return self.send_json({"error": "A published or in-progress reel cannot be rejected here."}, 400)
                     conn.execute("UPDATE stories SET status='rejected' WHERE id=?", (sid,))
@@ -1154,26 +1350,47 @@ class Handler(BaseHTTPRequestHandler):
                             "revise": "Reel returned to review. Save any changes and approve it again.",
                             "reject": "Idea rejected.", "draft": "Draft created."}
                 return self.send_json({"story": updated, "message": messages.get(action, "Updated.")})
+            social_copy_match = re.fullmatch(r"/api/stories/(\d+)/social-copy", self.path)
+            if social_copy_match:
+                sid = int(social_copy_match.group(1))
+                story = conn.execute("SELECT * FROM stories WHERE id=?", (sid,)).fetchone()
+                if not story:
+                    conn.close()
+                    return self.send_json({"error": "Story not found."}, 404)
+                if story["status"] != "draft" or not story["script"]:
+                    conn.close()
+                    return self.send_json({"error": "Return this story to draft review before regenerating its description and video hook."}, 400)
+                copy = make_social_copy(dict(story))
+                conn.execute("UPDATE stories SET caption=?,video_text=?,render_file='' WHERE id=?",
+                             (copy["caption"], copy["video_text"], sid))
+                conn.commit()
+                updated = row_dict(conn.execute("SELECT * FROM stories WHERE id=?", (sid,)).fetchone())
+                conn.close()
+                return self.send_json({"story": updated, "message": "Detailed description and opening text generated. Review them and render the reel again."})
             match = re.fullmatch(r"/api/stories/(\d+)/edit", self.path)
             if match:
                 sid = int(match.group(1))
-                old = conn.execute("SELECT script,caption,status,fb_publish_state FROM stories WHERE id=?", (sid,)).fetchone()
+                old = conn.execute("SELECT script,caption,video_text,status,fb_publish_state FROM stories WHERE id=?", (sid,)).fetchone()
                 if not old:
                     conn.close()
                     return self.send_json({"error": "Story not found."}, 404)
-                if old["status"] == "rejected" or (old["fb_publish_state"] or "") in ("published", "starting", "uploading", "uploaded", "publishing", "publish_unknown"):
+                if old["status"] == "rejected" or (old["fb_publish_state"] or "") in ("published", "scheduled", "starting", "uploading", "uploaded", "publishing", "publish_unknown"):
                     conn.close()
                     return self.send_json({"error": "This reel cannot be edited after rejection or while Facebook publishing is active."}, 400)
                 new_script = str(payload.get("script", ""))[:12000]
-                new_caption = str(payload.get("caption", ""))[:2000]
+                new_caption = str(payload.get("caption", ""))[:4000]
+                new_video_text = str(payload.get("video_text", old["video_text"] or ""))[:120].strip()
                 if new_script != old["script"]:
-                    conn.execute("UPDATE stories SET script=?,caption=?,audio_file='',render_file='',visual_plan='',status='draft' WHERE id=?",
-                                 (new_script, new_caption, sid))
+                    conn.execute("UPDATE stories SET script=?,caption=?,video_text=?,audio_file='',render_file='',visual_plan='',status='draft' WHERE id=?",
+                                 (new_script, new_caption, new_video_text, sid))
+                elif new_video_text != (old["video_text"] or ""):
+                    conn.execute("UPDATE stories SET caption=?,video_text=?,render_file='',status='draft' WHERE id=?",
+                                 (new_caption, new_video_text, sid))
                 elif new_caption != old["caption"]:
-                    conn.execute("UPDATE stories SET caption=?,status=CASE WHEN status='approved' THEN 'draft' ELSE status END WHERE id=?",
-                                 (new_caption, sid))
+                    conn.execute("UPDATE stories SET caption=?,video_text=?,status=CASE WHEN status='approved' THEN 'draft' ELSE status END WHERE id=?",
+                                 (new_caption, new_video_text, sid))
                 else:
-                    conn.execute("UPDATE stories SET caption=? WHERE id=?", (new_caption, sid))
+                    conn.execute("UPDATE stories SET caption=?,video_text=? WHERE id=?", (new_caption, new_video_text, sid))
                 conn.commit()
                 updated = conn.execute("SELECT * FROM stories WHERE id=?", (sid,)).fetchone()
                 conn.close()
@@ -1187,6 +1404,11 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    db().close()
+    startup_db = db()
+    startup_db.execute("UPDATE stories SET fb_publish_state='failed' WHERE fb_publish_state='starting'")
+    startup_db.execute("UPDATE stories SET fb_publish_state='uploading' WHERE fb_publish_state='transfer_in_progress'")
+    startup_db.execute("UPDATE stories SET fb_publish_state='publish_unknown' WHERE fb_publish_state='publishing'")
+    startup_db.commit()
+    startup_db.close()
     print(f"The Finance Brief is ready at http://127.0.0.1:{PORT}")
     ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
